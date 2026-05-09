@@ -1,25 +1,23 @@
 AddCSLuaFile("cl_init.lua")
+AddCSLuaFile("cl_trailsystem.lua")
 AddCSLuaFile("shared.lua")
 include("shared.lua")
 
 -- ============================================================
--- ENGINE SOUND  (generic GMod wind loop)
+-- SHARD / GRAVITY
 -- ============================================================
 
-local ENGINE_LOOP_SOUND = "ambient/wind/wind_atlas_loop1.wav"   -- vanilla GMod wind
 local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
 local GRAVITY_MULT      = 1.1
 local SHARD_LIFE        = 8
 
 -- ============================================================
 -- ALTITUDE BLEED
--- Glide-bomb slowly loses lift.  Rate is in Hammer units/sec.
+-- Constant 8 u/s — always visibly descending, no luck variance.
 -- ============================================================
 
-local GLIDE_BLEED_RATE      = 6.0   -- units/sec downward drift during loiter
-local GLIDE_BLEED_RATE_MIN  = 2.0   -- minimum bleed (bomb can't fully arrest the sink)
-local GLIDE_BLEED_RATE_MAX  = 10.0  -- maximum instantaneous bleed
-local GROUND_DETONATE_DIST  = 80    -- units above ground → detonate payload
+local GLIDE_BLEED_RATE     = 8.0   -- units/sec, constant
+local GROUND_DETONATE_DIST = 80    -- units above ground → impact detonate
 
 -- ============================================================
 -- TUNING
@@ -82,7 +80,7 @@ function ENT:Initialize()
 	local ground = self:FindGround(self.CenterPos)
 	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-	self.GroundZ = ground   -- cached ground level for proximity check
+	self.GroundZ = ground
 
 	local altVariance = self.SkyHeightAdd * 0.25
 	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVariance, altVariance)
@@ -135,9 +133,6 @@ function ENT:Initialize()
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self:GetAngles().y
 
-	-- --------------------------------------------------------
-	-- GLIDE WOBBLE
-	-- --------------------------------------------------------
 	self.JitterPhase  = math.Rand(0, math.pi * 2)
 	self.JitterPhase2 = math.Rand(0, math.pi * 2)
 	self.JitterAmp1   = math.Rand(40,  80)
@@ -149,14 +144,8 @@ function ENT:Initialize()
 	self.GlideRollAmp   = math.Rand(18, 38)
 	self.GlideRollRate  = math.Rand(0.8, 1.6)
 
-	-- --------------------------------------------------------
-	-- ALTITUDE BLEED STATE
-	-- sky starts at spawn height; bleeds down per-tick at
-	-- GLIDE_BLEED_RATE units/sec, clamped above GroundZ.
-	-- The drift target tracks the bleeding sky so the bomb
-	-- naturally descends instead of fighting back to spawn alt.
-	-- --------------------------------------------------------
-	self.GlideBleedRate = math.Rand(GLIDE_BLEED_RATE_MIN, GLIDE_BLEED_RATE_MAX)
+	-- Constant bleed — no random variance
+	self.GlideBleedRate = GLIDE_BLEED_RATE
 
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
@@ -177,14 +166,8 @@ function ENT:Initialize()
 		self.PhysObj:EnableGravity(false)
 	end
 
-	-- Wind sound loop
-	self.EngineLoop = CreateSound(self, ENGINE_LOOP_SOUND)
-	if self.EngineLoop then
-		self.EngineLoop:SetSoundLevel(78)
-		self.EngineLoop:ChangePitch(95, 0)
-		self.EngineLoop:ChangeVolume(0.85, 0)
-		self.EngineLoop:Play()
-	end
+	-- NOTE: No server-side CreateSound here.
+	-- Sound is handled entirely in cl_init.lua.
 
 	self.CurrentWeapon   = nil
 	self.WeaponWindowEnd = 0
@@ -297,11 +280,6 @@ function ENT:SetDestroyed()
 
 	self:Ignite(20, 0)
 	self:SpawnDebrisShards()
-
-	if self.EngineLoop then
-		self.EngineLoop:ChangeVolume(0, 1.5)
-		self.EngineLoop:ChangePitch(55, 2.5)
-	end
 
 	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
 	local delay = math.Clamp(altAboveGround / 600, 3, 12)
@@ -459,18 +437,17 @@ function ENT:UpdateOrbit(ct, phys)
 	local desiredY = cy + math.sin(self.OrbitAngle) * self.OrbitRadius
 
 	-- --------------------------------------------------------
-	-- ALTITUDE BLEED
-	-- Bleed the sky reference downward every tick.  The drift
-	-- target is kept at sky so new random picks stay grounded
-	-- in the actual current ceiling, not the original spawn alt.
+	-- ALTITUDE BLEED  (constant 8 u/s)
+	-- Bleed the sky ceiling every tick.  AltDriftTarget repicks
+	-- are clamped to ±30% of AltDriftRange around sky so they
+	-- cannot fight the bleed direction.
 	-- --------------------------------------------------------
 	self.sky = self.sky - self.GlideBleedRate * dt
-	-- Hard floor: never bleed below GroundZ + minimum safe clearance
 	self.sky = math.max(self.sky, self.GroundZ + GROUND_DETONATE_DIST + 50)
 
-	-- Drift repick — target follows the bleeding sky
 	if ct >= self.AltDriftNextPick then
-		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange * 0.5, self.AltDriftRange * 0.5)
+		local halfRange = self.AltDriftRange * 0.3
+		self.AltDriftTarget   = self.sky + math.Rand(-halfRange, halfRange)
 		self.AltDriftNextPick = ct + math.Rand(8, 20)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
@@ -480,17 +457,11 @@ function ENT:UpdateOrbit(ct, phys)
 	           + math.sin(ct * self.JitterRate2 * math.pi * 2 + self.JitterPhase2) * self.JitterAmp2
 	local liveAlt = self.AltDriftCurrent + jitter + self.ObsAltBias
 
-	-- --------------------------------------------------------
-	-- GROUND-PROXIMITY DETONATION
-	-- If the live altitude (including jitter) would put the
-	-- bomb within GROUND_DETONATE_DIST of the ground, and the
-	-- dive has not yet been triggered, fire the payload.
-	-- --------------------------------------------------------
+	-- Ground-proximity detonation
 	if not self.ExplodedAlready then
 		local heightAboveGround = liveAlt - self.GroundZ
 		if heightAboveGround <= GROUND_DETONATE_DIST then
 			self:Debug("Altitude bleed reached ground — impact detonation")
-			-- snap position to just above ground so the effect looks right
 			local impactPos = Vector(self:GetPos().x, self:GetPos().y, self.GroundZ + 10)
 			self:DiveExplode(impactPos)
 			return
@@ -667,7 +638,7 @@ function ENT:UpdateDive(ct)
 		self.DiveNextTrack = ct + self.DIVE_TrackInterval
 	end
 
-	-- Bug-fix: re-acquire instead of silent Remove
+	-- Safe nil-guard: re-acquire target instead of silent Remove
 	if not self.DiveTargetPos then
 		local t = self:GetPrimaryTarget()
 		if IsValid(t) then
@@ -805,8 +776,6 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-	if self.EngineLoop then
-		self.EngineLoop:Stop()
-		self.EngineLoop = nil
-	end
+	-- Sound cleanup is handled by cl_init.lua on the client.
+	-- Nothing to do server-side.
 end

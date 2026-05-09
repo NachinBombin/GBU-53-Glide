@@ -1,153 +1,91 @@
 include("shared.lua")
+include("cl_trailsystem.lua")
 
--- ================================================================
--- GBU-53/B StormBreaker -- CLIENT
--- Health degradation FX: flames, sparks via particle system.
--- ================================================================
+-- ============================================================
+-- CLIENT ENGINE SOUND
+-- CreateSound here (client-side) so the positional 3-D sound
+-- actually works.  A server-side CreateSound on a custom wav
+-- is never heard because the client never precaches it.
+-- ============================================================
 
-game.AddParticles("particles/fire_01.pcf")
-PrecacheParticleSystem("fire_medium_02")
+local ENGINE_LOOP_SOUND = "ambient/wind/wind_atlas_loop1.wav"
 
-local TIER_OFFSETS = {
-	[1] = {
-		{ x =  12, y =   0, z = 0 },
-		{ x = -12, y =   0, z = 0 },
-	},
-	[2] = {
-		{ x =  12, y =   0, z = 0 },
-		{ x = -12, y =   0, z = 0 },
-		{ x =   0, y =  -8, z = 2 },
-		{ x =   0, y =  12, z = 2 },
-	},
+-- ============================================================
+-- DAMAGE TIER PARTICLES
+-- ============================================================
+
+local TIER_PARTICLES = {
+	[1] = { name = "fire_medium_01",  offset = Vector(0, -30,  5), scale = 0.6 },
+	[2] = { name = "fire_large_01",   offset = Vector(0, -30, 10), scale = 1.0 },
+	[3] = { name = "fire_large_02",   offset = Vector(0, -20, 15), scale = 1.4 },
 }
 
-local TIER_BURST_DELAY = { [1] = 5.0, [2] = 2.5, [3] = 0.9 }
-local TIER_BURST_COUNT = { [1] = 1,   [2] = 2,   [3] = 5   }
-
-local GBU53States = {}
-
-local function BurstAt(pos, tier)
-	local ed = EffectData()
-	ed:SetOrigin(pos)
-	ed:SetScale(1)
-	util.Effect("Explosion", ed)
-
-	local sed = EffectData()
-	sed:SetOrigin(pos)
-	sed:SetScale(1)
-	util.Effect("ManhackSparks", sed)
-
-	if tier >= 2 then
-		local eed = EffectData()
-		eed:SetOrigin(pos)
-		eed:SetScale(1)
-		util.Effect("ElectricSpark", eed)
-	end
-end
-
-local function SpawnBurstFX(ent, tier)
-	if not IsValid(ent) then return end
-	local count = TIER_BURST_COUNT[tier] or 1
-	local right = ent:GetRight()
-	for i = 1, count do
-		local offset = right * math.Rand(-12, 12)
-		BurstAt(ent:GetPos() + offset, tier)
-	end
-end
-
-local function ApplyFlameParticles(state, ent, tier)
-	for _, p in ipairs(state.particles) do
-		if IsValid(p) then p:StopEmission() end
-	end
-	state.particles = {}
-
-	local offsets = TIER_OFFSETS[tier]
-	if not offsets then return end
-
-	for _, off in ipairs(offsets) do
-		local p = CreateParticleSystem(ent, "fire_medium_02", PATTACH_ABSORIGIN_FOLLOW)
-		if IsValid(p) then
-			p:SetControlPoint(0, ent:GetPos() + ent:GetRight()   * off.x
-			                                 + ent:GetUp()      * off.z
-			                                 + ent:GetForward() * off.y)
-			table.insert(state.particles, p)
-		end
-	end
-end
-
 net.Receive("bombin_gbu53_damage_tier", function()
-	local idx  = net.ReadUInt(16)
-	local tier = net.ReadUInt(2)
+	local entIdx = net.ReadUInt(16)
+	local tier   = net.ReadUInt(2)
 
-	local ent = ents.GetByIndex(idx)
+	local ent = Entity(entIdx)
+	if not IsValid(ent) then return end
 
-	if not IsValid(ent) then
-		GBU53States[idx] = GBU53States[idx] or { tier = 0, particles = {}, nextBurst = 0, pendingTier = nil }
-		GBU53States[idx].pendingTier = tier
+	-- Stop any running particle before starting the next tier
+	local prev = ent.GBU53_ActiveParticle
+	if IsValid(prev) then prev:StopEmission() end
+
+	if tier == 0 then
+		ent.GBU53_ActiveParticle = nil
 		return
 	end
 
-	local state = GBU53States[idx] or { tier = 0, particles = {}, nextBurst = 0, pendingTier = nil }
-	GBU53States[idx] = state
-	state.tier = tier
+	local cfg = TIER_PARTICLES[tier]
+	if not cfg then return end
 
-	ApplyFlameParticles(state, ent, tier)
-end)
-
-hook.Add("Think", "bombin_gbu53_damage_fx", function()
-	local ct = CurTime()
-	for idx, state in pairs(GBU53States) do
-		local ent = ents.GetByIndex(idx)
-
-		if not IsValid(ent) then
-			for _, p in ipairs(state.particles) do
-				if IsValid(p) then p:StopEmission() end
-			end
-			GBU53States[idx] = nil
-			continue
-		end
-
-		if state.pendingTier then
-			state.tier = state.pendingTier
-			state.pendingTier = nil
-			ApplyFlameParticles(state, ent, state.tier)
-		end
-
-		if state.tier == 0 then continue end
-
-		local offsets = TIER_OFFSETS[state.tier]
-		if offsets then
-			for i, p in ipairs(state.particles) do
-				if IsValid(p) and offsets[i] then
-					local off = offsets[i]
-					p:SetControlPoint(0, ent:GetPos() + ent:GetRight()   * off.x
-					                                 + ent:GetUp()      * off.z
-					                                 + ent:GetForward() * off.y)
-				end
-			end
-		end
-
-		local delay = TIER_BURST_DELAY[state.tier] or 5
-		if ct >= state.nextBurst then
-			SpawnBurstFX(ent, state.tier)
-			state.nextBurst = ct + delay + math.Rand(-delay * 0.2, delay * 0.2)
-		end
+	local ps = CreateParticleSystem(ent, cfg.name, PATTACH_POINT_FOLLOW, 0)
+	if IsValid(ps) then
+		ps:SetControlPoint(0, ent:GetPos() + cfg.offset)
+		ps:SetSortOrigin(ent:GetPos())
+		ent.GBU53_ActiveParticle = ps
 	end
 end)
 
+-- ============================================================
+-- ENTITY HOOKS
+-- ============================================================
+
 function ENT:Initialize()
+	-- Register trail
+	GBU53Trail_Register(self)
+
+	-- Client-side engine sound
+	self.GBU53_EngineSound = CreateSound(self, ENGINE_LOOP_SOUND)
+	if self.GBU53_EngineSound then
+		self.GBU53_EngineSound:SetSoundLevel(78)
+		self.GBU53_EngineSound:ChangePitch(95, 0)
+		self.GBU53_EngineSound:ChangeVolume(0.85, 0)
+		self.GBU53_EngineSound:Play()
+	end
+end
+
+function ENT:Think()
+	-- Keep sound alive and positioned while the entity exists
+	if self.GBU53_EngineSound and not self.GBU53_EngineSound:IsPlaying() then
+		self.GBU53_EngineSound:Play()
+	end
+end
+
+function ENT:OnRemove()
+	GBU53Trail_Unregister(self)
+
+	if self.GBU53_EngineSound then
+		self.GBU53_EngineSound:FadeOut(0.4)
+		self.GBU53_EngineSound = nil
+	end
+
+	if IsValid(self.GBU53_ActiveParticle) then
+		self.GBU53_ActiveParticle:StopEmission()
+		self.GBU53_ActiveParticle = nil
+	end
 end
 
 function ENT:Draw()
 	self:DrawModel()
-end
-
-function ENT:OnRemove()
-	local state = GBU53States[self:EntIndex()]
-	if state then
-		for _, p in ipairs(state.particles) do
-			if IsValid(p) then p:StopEmission() end
-		end
-		GBU53States[self:EntIndex()] = nil
-	end
 end
