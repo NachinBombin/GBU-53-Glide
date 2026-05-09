@@ -16,9 +16,9 @@ local TRAIL_TEX       = "trails/smoke"
 -- [2] = starboard fin-tip
 -- [3] = port fin-tip
 local TRAIL_OFFSETS = {
-	Vector(  0,  -55,   0 ),
-	Vector( 28,  -10,  -4 ),
-	Vector(-28,  -10,  -4 ),
+	Vector(  -60,  20,   0 ),
+	Vector( -50,  0,  0 ),
+	Vector( -60,  -20,  0 ),
 }
 
 local GBU53Trails = {}   -- [EntIndex] = { { samples }, { samples }, { samples } }
