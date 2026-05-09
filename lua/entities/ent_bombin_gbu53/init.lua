@@ -3,13 +3,23 @@ AddCSLuaFile("shared.lua")
 include("shared.lua")
 
 -- ============================================================
--- ENGINE SOUND  (re-used from Shahed for now)
+-- ENGINE SOUND  (generic GMod wind loop)
 -- ============================================================
 
-local ENGINE_LOOP_SOUND = "shahed/eng_loop.wav"
+local ENGINE_LOOP_SOUND = "ambient/wind/wind_atlas_loop1.wav"   -- vanilla GMod wind
 local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
 local GRAVITY_MULT      = 1.1
 local SHARD_LIFE        = 8
+
+-- ============================================================
+-- ALTITUDE BLEED
+-- Glide-bomb slowly loses lift.  Rate is in Hammer units/sec.
+-- ============================================================
+
+local GLIDE_BLEED_RATE      = 6.0   -- units/sec downward drift during loiter
+local GLIDE_BLEED_RATE_MIN  = 2.0   -- minimum bleed (bomb can't fully arrest the sink)
+local GLIDE_BLEED_RATE_MAX  = 10.0  -- maximum instantaneous bleed
+local GROUND_DETONATE_DIST  = 80    -- units above ground → detonate payload
 
 -- ============================================================
 -- TUNING
@@ -72,6 +82,8 @@ function ENT:Initialize()
 	local ground = self:FindGround(self.CenterPos)
 	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
+	self.GroundZ = ground   -- cached ground level for proximity check
+
 	local altVariance = self.SkyHeightAdd * 0.25
 	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVariance, altVariance)
 
@@ -124,22 +136,27 @@ function ENT:Initialize()
 	self.PrevYaw       = self:GetAngles().y
 
 	-- --------------------------------------------------------
-	-- GLIDE WOBBLE — considerably amplified vs Shahed
-	-- Two superimposed sine layers on altitude (same as Shahed
-	-- jitter) but with larger amplitudes and slower rates to
-	-- sell the "gliding / unstable" feel.
+	-- GLIDE WOBBLE
 	-- --------------------------------------------------------
 	self.JitterPhase  = math.Rand(0, math.pi * 2)
 	self.JitterPhase2 = math.Rand(0, math.pi * 2)
-	self.JitterAmp1   = math.Rand(40,  80)    -- Shahed: 8-18  → x5
-	self.JitterAmp2   = math.Rand(90, 180)    -- Shahed: 20-45 → x4
+	self.JitterAmp1   = math.Rand(40,  80)
+	self.JitterAmp2   = math.Rand(90, 180)
 	self.JitterRate1  = math.Rand(0.040, 0.090)
 	self.JitterRate2  = math.Rand(0.012, 0.025)
 
-	-- Roll wobble — extra layer unique to glide munition
 	self.GlideRollPhase = math.Rand(0, math.pi * 2)
-	self.GlideRollAmp   = math.Rand(18, 38)   -- degrees of extra roll sway
+	self.GlideRollAmp   = math.Rand(18, 38)
 	self.GlideRollRate  = math.Rand(0.8, 1.6)
+
+	-- --------------------------------------------------------
+	-- ALTITUDE BLEED STATE
+	-- sky starts at spawn height; bleeds down per-tick at
+	-- GLIDE_BLEED_RATE units/sec, clamped above GroundZ.
+	-- The drift target tracks the bleeding sky so the bomb
+	-- naturally descends instead of fighting back to spawn alt.
+	-- --------------------------------------------------------
+	self.GlideBleedRate = math.Rand(GLIDE_BLEED_RATE_MIN, GLIDE_BLEED_RATE_MAX)
 
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
@@ -160,11 +177,12 @@ function ENT:Initialize()
 		self.PhysObj:EnableGravity(false)
 	end
 
+	-- Wind sound loop
 	self.EngineLoop = CreateSound(self, ENGINE_LOOP_SOUND)
 	if self.EngineLoop then
-		self.EngineLoop:SetSoundLevel(75)
-		self.EngineLoop:ChangePitch(85, 0)
-		self.EngineLoop:ChangeVolume(1.0, 0)
+		self.EngineLoop:SetSoundLevel(78)
+		self.EngineLoop:ChangePitch(95, 0)
+		self.EngineLoop:ChangeVolume(0.85, 0)
 		self.EngineLoop:Play()
 	end
 
@@ -192,7 +210,6 @@ function ENT:Initialize()
 
 	self.DivePitchTelegraph = 0
 
-	-- Death tumble state
 	self.Destroyed       = false
 	self.DestroyedTime   = nil
 	self.TumbleAngVel    = Vector(0,0,0)
@@ -303,7 +320,7 @@ end
 
 function ENT:OnTakeDamage(dmginfo)
 	if self.ExplodedAlready then return end
-	if self.Destroyed then return end   -- bug-fix: skip tier broadcast on dead ent
+	if self.Destroyed then return end
 	if dmginfo:IsDamageType(DMG_CRUSH) then return end
 
 	local hp = self:GetNWInt("HP", self.MaxHP or 200)
@@ -350,7 +367,7 @@ function ENT:Think()
 		if fadeT >= 1 then self:SetRenderMode(RENDERMODE_NORMAL) end
 	end
 
-	-- Explode timer for destroyed state
+	-- Explode timer for destroyed (shot-down) state
 	if self.Destroyed then
 		if self.ExplodeTimer and ct >= self.ExplodeTimer and not self.ExplodedAlready then
 			self:CrashExplode(self:GetPos())
@@ -441,17 +458,44 @@ function ENT:UpdateOrbit(ct, phys)
 	local desiredX = cx + math.cos(self.OrbitAngle) * self.OrbitRadius
 	local desiredY = cy + math.sin(self.OrbitAngle) * self.OrbitRadius
 
-	-- Altitude drift
+	-- --------------------------------------------------------
+	-- ALTITUDE BLEED
+	-- Bleed the sky reference downward every tick.  The drift
+	-- target is kept at sky so new random picks stay grounded
+	-- in the actual current ceiling, not the original spawn alt.
+	-- --------------------------------------------------------
+	self.sky = self.sky - self.GlideBleedRate * dt
+	-- Hard floor: never bleed below GroundZ + minimum safe clearance
+	self.sky = math.max(self.sky, self.GroundZ + GROUND_DETONATE_DIST + 50)
+
+	-- Drift repick — target follows the bleeding sky
 	if ct >= self.AltDriftNextPick then
-		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
+		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange * 0.5, self.AltDriftRange * 0.5)
 		self.AltDriftNextPick = ct + math.Rand(8, 20)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-	-- Glide jitter on altitude (amplified)
+	-- Glide jitter on altitude
 	local jitter = math.sin(ct * self.JitterRate1 * math.pi * 2 + self.JitterPhase)  * self.JitterAmp1
 	           + math.sin(ct * self.JitterRate2 * math.pi * 2 + self.JitterPhase2) * self.JitterAmp2
 	local liveAlt = self.AltDriftCurrent + jitter + self.ObsAltBias
+
+	-- --------------------------------------------------------
+	-- GROUND-PROXIMITY DETONATION
+	-- If the live altitude (including jitter) would put the
+	-- bomb within GROUND_DETONATE_DIST of the ground, and the
+	-- dive has not yet been triggered, fire the payload.
+	-- --------------------------------------------------------
+	if not self.ExplodedAlready then
+		local heightAboveGround = liveAlt - self.GroundZ
+		if heightAboveGround <= GROUND_DETONATE_DIST then
+			self:Debug("Altitude bleed reached ground — impact detonation")
+			-- snap position to just above ground so the effect looks right
+			local impactPos = Vector(self:GetPos().x, self:GetPos().y, self.GroundZ + 10)
+			self:DiveExplode(impactPos)
+			return
+		end
+	end
 
 	local pos = self:GetPos()
 	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
@@ -472,9 +516,8 @@ function ENT:UpdateOrbit(ct, phys)
 	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
 	self.PrevYaw      = self.ang.y
 
-	local targetRoll  = math.Clamp(rawYawDelta * -25, -30, 30)
-	-- Add sinusoidal glide roll sway
-	local glideSway   = math.sin(ct * self.GlideRollRate + self.GlideRollPhase) * self.GlideRollAmp
+	local targetRoll = math.Clamp(rawYawDelta * -25, -30, 30)
+	local glideSway  = math.sin(ct * self.GlideRollRate + self.GlideRollPhase) * self.GlideRollAmp
 	self.SmoothedRoll = Lerp(rawYawDelta ~= 0 and 0.15 or 0.05, self.SmoothedRoll, targetRoll + glideSway)
 
 	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
@@ -703,7 +746,7 @@ function ENT:DiveExplode(pos)
 	if self.DiveExploded then return end
 	self.DiveExploded    = true
 	self.ExplodedAlready = true
-	self:Debug("DIVE: exploding at " .. tostring(pos))
+	self:Debug("DIVE/IMPACT: exploding at " .. tostring(pos))
 
 	local ed1 = EffectData()
 	ed1:SetOrigin(pos)
